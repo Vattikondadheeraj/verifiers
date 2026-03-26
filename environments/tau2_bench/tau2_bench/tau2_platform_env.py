@@ -102,7 +102,7 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
         state["__tau2_tools__"] = tools
         state["__tau2_policy__"] = policy
         state["__tau2_error_count__"] = 0
-        state["__tau2_max_errors__"] = 5
+        state["__tau2_max_errors__"] = 10
         state["__tau2_turn_count__"] = 0
         state["__tau2_min_turns__"] = 3
 
