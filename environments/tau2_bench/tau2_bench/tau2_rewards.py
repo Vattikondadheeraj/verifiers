@@ -120,12 +120,21 @@ def build_simulation_run(
         # Deduplicate messages that appear in both prompt and completion of successive steps.
         # tool_call_id must be included in the key so that two different tool results with
         # identical content are not incorrectly collapsed into one.
+        def _norm_content(c):
+            """Normalize content for dedup: strip <think> blocks, treat None/"" as identical."""
+            s = (c or "").strip()
+            # Strip <think>...</think> blocks — with enable_thinking=true the same assistant
+            # message appears in completion with think content and in the next step's prompt
+            # with think stripped, producing two different content values for the same message.
+            s = re.sub(r"<think>.*?</think>\s*", "", s, flags=re.DOTALL).strip()
+            return s
+
         seen = set()
         unique_messages = []
         for msg in all_messages:
             key = (
                 msg.get("role", ""),
-                msg.get("content") or "",  # normalize None → "" so both copies are treated as identical
+                _norm_content(msg.get("content")),
                 str(msg.get("tool_calls") or ""),
                 msg.get("tool_call_id", ""),
             )
