@@ -42,6 +42,8 @@ Your goal is to get a booking that matches your user's preferences as closely as
 
 Be clear, concise, and assertive about preferences. If the agent offers something that doesn't match, negotiate for better options.
 
+Use <think>...</think> for your internal reasoning only. After </think>, output your actual message to the airline agent — never put your final response inside the <think> block.
+
 {context}"""
 
 
@@ -112,6 +114,7 @@ class Tau2UserEnv(vf.MultiTurnEnv):
         state["__tau2_agent_state__"] = agent_state
         state["__tau2_error_count__"] = 0
         state["__tau2_max_errors__"] = 5
+        state["__tau2_turn_count__"] = 0
 
         # Build user context for system prompt
         user_data = info.get("user_data", {})
@@ -127,6 +130,10 @@ class Tau2UserEnv(vf.MultiTurnEnv):
     async def too_many_tool_errors(self, state: State) -> bool:
         return state.get("__tau2_error_count__", 0) >= state.get("__tau2_max_errors__", 5)
 
+    async def get_prompt_messages(self, state: State) -> Messages:
+        messages = await super().get_prompt_messages(state)
+        return _strip_thinking(messages)
+
     async def env_response(
         self, messages: Messages, state: State, **kwargs
     ) -> Messages | str:
@@ -140,10 +147,18 @@ class Tau2UserEnv(vf.MultiTurnEnv):
         if last_msg is None:
             return [{"role": "user", "content": "Please state your request to the airline agent."}]
 
-        user_text = last_msg.get("content", "")
+        # If content is None (reasoning_parser put everything in reasoning_content), use that.
+        user_text = last_msg.get("content") or last_msg.get("reasoning_content") or ""
+
+        if not user_text:
+            logger.warning("Trained model returned empty/None content — ending rollout")
+            state["__tau2_termination__"] = "error"
+            state["final_env_response"] = [{"role": "user", "content": "[no response]"}]
+            return state["final_env_response"]
 
         # Check if user said STOP
         if STOP_TOKEN in user_text:
+            state["__tau2_termination__"] = "user_stop"
             state["final_env_response"] = [
                 {"role": "user", "content": "[Conversation ended by user]"}
             ]
@@ -156,6 +171,8 @@ class Tau2UserEnv(vf.MultiTurnEnv):
         # Forward user message to platform agent
         user_msg = Tau2UserMsg(role="user", content=user_text)
 
+        prev_msg_len = len(agent_state.messages)
+
         try:
             agent_response = await _run_platform_agent_turn(
                 platform_agent=platform_agent,
@@ -166,6 +183,7 @@ class Tau2UserEnv(vf.MultiTurnEnv):
             )
         except Exception as exc:
             logger.warning("Platform agent error: %s", exc)
+            state["__tau2_termination__"] = "error"
             state["final_env_response"] = [
                 {"role": "user", "content": f"[Platform agent error: {exc}]"}
             ]
@@ -173,12 +191,23 @@ class Tau2UserEnv(vf.MultiTurnEnv):
 
         state["__tau2_agent_state__"] = agent_state
 
+        # Accumulate platform agent messages for reward evaluation.
+        # These contain tool calls (including book_reservation) that the evaluators need.
+        new_msgs = list(agent_state.messages[prev_msg_len:])
+        if "__platform_msgs__" not in state:
+            state["__platform_msgs__"] = []
+        state["__platform_msgs__"].extend(new_msgs)
+
         # Check for platform agent stop
         if STOP_TOKEN in (agent_response or ""):
+            state["__tau2_termination__"] = "agent_stop"
             state["final_env_response"] = [
                 {"role": "user", "content": agent_response}
             ]
             return state["final_env_response"]
+
+        # Increment turn count (each text exchange = 1 turn)
+        state["__tau2_turn_count__"] = state.get("__tau2_turn_count__", 0) + 1
 
         # Return platform agent's text as a "user" message (from the env's perspective,
         # the platform agent's response is the environment's response to the user model)
@@ -216,7 +245,8 @@ async def _run_platform_agent_turn(
                 try:
                     result = tools.use_tool(tc.name, **tc.arguments)
                     if not isinstance(result, str):
-                        result = json.dumps(result, default=str)
+                        from tau2.environment.environment import Environment as Tau2Environment
+                        result = Tau2Environment.to_json_str(result)
                     tool_results.append(
                         Tau2ToolMsg(
                             id=tc.id,
@@ -245,6 +275,37 @@ async def _run_platform_agent_turn(
         return agent_reply.content or ""
 
     return "[Platform agent exceeded maximum internal steps]"
+
+
+def _strip_thinking(messages: Messages) -> Messages:
+    """Remove thinking/reasoning content from assistant messages in context history.
+
+    Think blocks and reasoning_content accumulate across turns and cause context overflow
+    with extended-thinking models (e.g. Qwen3 thinking mode). Always returns typed
+    AssistantMessage objects (not plain dicts) so verifiers' client can serialize correctly.
+    """
+    import re
+    from verifiers.types import AssistantMessage
+
+    def _clean(content, reasoning_content, tool_calls):
+        if content and isinstance(content, str):
+            content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
+        if not content:
+            content = reasoning_content or ""
+        return content, (tool_calls if tool_calls is not None else None)
+
+    result = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            content, tc = _clean(msg.get("content"), msg.get("reasoning_content"), msg.get("tool_calls"))
+            result.append(AssistantMessage(role="assistant", content=content, tool_calls=tc))
+        elif hasattr(msg, "role") and msg.role == "assistant":
+            rc = getattr(msg, "reasoning_content", None)
+            content, tc = _clean(getattr(msg, "content", None), rc, getattr(msg, "tool_calls", None))
+            result.append(AssistantMessage(role="assistant", content=content, tool_calls=tc))
+        else:
+            result.append(msg)
+    return result
 
 
 def _get_last_assistant(messages: Messages) -> Optional[dict[str, Any]]:

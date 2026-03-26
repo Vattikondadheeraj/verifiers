@@ -275,11 +275,18 @@ class OpenAIChatCompletionsClient(
             sampling_args = {**sampling_args, "modalities": ["text"]}
 
         if tools:
+            norm_args = normalize_sampling_args(sampling_args)
+            # tool_choice="auto" is required for vLLM's hermes tool_call_parser
+            # to extract <tool_call> blocks from model output into tool_calls.
+            # Without it vLLM falls into the "no tool_choice" branch and discards
+            # parsed tool calls (chat_completion_full_generator line ~218).
+            if "tool_choice" not in norm_args:
+                norm_args["tool_choice"] = "auto"
             response = await self.client.chat.completions.create(
                 model=model,
                 messages=prompt,
                 tools=tools,
-                **normalize_sampling_args(sampling_args),
+                **norm_args,
             )
         else:
             response = await self.client.chat.completions.create(

@@ -42,6 +42,8 @@ You cannot do both at the same time.
 
 Always follow the policy. Always generate valid JSON for tool calls.
 
+Use <think>...</think> for your internal reasoning only. After </think>, output your actual message to the user OR your tool call — never put your final response inside the <think> block.
+
 <policy>
 {policy}
 </policy>"""
@@ -137,6 +139,10 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
     async def too_many_tool_errors(self, state: State) -> bool:
         return state.get("__tau2_error_count__", 0) >= state.get("__tau2_max_errors__", 5)
 
+    async def get_prompt_messages(self, state: State) -> Messages:
+        messages = await super().get_prompt_messages(state)
+        return _strip_thinking(messages)
+
     async def env_response(
         self, messages: Messages, state: State, **kwargs
     ) -> Messages | str:
@@ -152,6 +158,8 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
 
         tools: AirlineTools = state["__tau2_tools__"]
         tool_calls = last_msg.get("tool_calls")
+        content_preview = (last_msg.get("content") or "")[:60]
+        print(f"[ENV_RESP] tool_calls={bool(tool_calls)} content={content_preview!r}", flush=True)
 
         # Case 1: Tool calls
         if tool_calls:
@@ -173,7 +181,14 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
             return tool_results
 
         # Case 2: Text response -> forward to simulated user
-        agent_text = last_msg.get("content", "")
+        # If content is None (reasoning_parser put everything in reasoning_content), use that.
+        agent_text = last_msg.get("content") or last_msg.get("reasoning_content") or ""
+
+        if not agent_text:
+            logger.warning("Trained model returned empty/None content — ending rollout")
+            state["__tau2_termination__"] = "error"
+            state["final_env_response"] = [{"role": "user", "content": "[no response]"}]
+            return state["final_env_response"]
         user_sim: UserSimulator = state["__tau2_user_sim__"]
         user_state = state["__tau2_user_state__"]
 
@@ -187,6 +202,7 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
             )
         except Exception as exc:
             logger.warning("User simulator error: %s", exc)
+            state["__tau2_termination__"] = "error"
             state["final_env_response"] = [
                 {"role": "user", "content": f"[User simulator error: {exc}] ###STOP###"}
             ]
@@ -194,13 +210,22 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
 
         state["__tau2_user_state__"] = user_state
 
-        user_content = user_msg.content or ""
+        # Simulator returned no content (e.g. model produced only thinking tokens).
+        # End the rollout cleanly so the sidecar gets saved, then discard for training.
+        if user_msg.content is None:
+            logger.warning("User simulator returned None content — ending rollout")
+            state["__tau2_termination__"] = "error"
+            state["final_env_response"] = [{"role": "user", "content": "[no response]"}]
+            return state["final_env_response"]
+
+        user_content = user_msg.content
 
         # Check for stop signals, but enforce minimum turns
         min_turns = state.get("__tau2_min_turns__", 3)
         current_turn = state.get("__tau2_turn_count__", 0)
         if UserSimulator.is_stop(user_msg):
             if current_turn >= min_turns:
+                state["__tau2_termination__"] = "user_stop"
                 state["final_env_response"] = [
                     {"role": "user", "content": user_content}
                 ]
@@ -230,6 +255,38 @@ def _get_last_assistant(messages: Messages) -> Optional[dict[str, Any]]:
         if hasattr(msg, "role") and msg.role == "assistant":
             return msg.model_dump() if hasattr(msg, "model_dump") else dict(msg)
     return None
+
+
+def _strip_thinking(messages: Messages) -> Messages:
+    """Remove thinking/reasoning content from assistant messages in context history.
+
+    Think blocks (<think>...</think>) and reasoning_content accumulate across turns
+    and cause context overflow with extended-thinking models (e.g. Qwen3 thinking mode).
+    Always returns typed AssistantMessage objects (not plain dicts) so verifiers'
+    client can serialize them correctly.
+    """
+    import re
+    from verifiers.types import AssistantMessage
+
+    def _clean(content, reasoning_content, tool_calls):
+        if content and isinstance(content, str):
+            content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
+        if not content:
+            content = reasoning_content or ""
+        return content, (tool_calls if tool_calls is not None else None)
+
+    result = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            content, tc = _clean(msg.get("content"), msg.get("reasoning_content"), msg.get("tool_calls"))
+            result.append(AssistantMessage(role="assistant", content=content, tool_calls=tc))
+        elif hasattr(msg, "role") and msg.role == "assistant":
+            rc = getattr(msg, "reasoning_content", None)
+            content, tc = _clean(getattr(msg, "content", None), rc, getattr(msg, "tool_calls", None))
+            result.append(AssistantMessage(role="assistant", content=content, tool_calls=tc))
+        else:
+            result.append(msg)
+    return result
 
 
 def _prepend_system(prompt: Messages, policy: str) -> Messages:

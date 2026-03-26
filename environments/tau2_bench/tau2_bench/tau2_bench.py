@@ -30,6 +30,9 @@ def load_environment(
     db_path: Optional[str] = None,
     email_prefs_path: Optional[str] = None,
     preference_profiles_path: Optional[str] = None,
+    platform_reward_basis: Optional[str] = None,
+    user_reward_basis: Optional[str] = None,
+    sidecar_dir: Optional[str] = None,
     **kwargs,
 ) -> vf.Environment:
     """Load the tau2-bench environment.
@@ -48,8 +51,9 @@ def load_environment(
         preference_profiles_path: Override path to user preference profiles.
         **kwargs: Extra arguments forwarded to the environment constructors.
     """
+    platform_rb = [r.strip() for r in platform_reward_basis.split(",")] if platform_reward_basis else None
+    user_rb = [r.strip() for r in user_reward_basis.split(",")] if user_reward_basis else None
     parser = vf.Parser()
-    rubric = build_rubric()
 
     envs = {}
 
@@ -67,7 +71,7 @@ def load_environment(
             db_path=db_path,
             max_turns=max_turns,
             parser=parser,
-            rubric=rubric,
+            rubric=build_rubric(reward_basis=platform_rb, sidecar_dir=sidecar_dir),
             **kwargs,
         )
         envs["platform"] = platform_env
@@ -86,7 +90,7 @@ def load_environment(
             db_path=db_path,
             max_turns=max_turns,
             parser=parser,
-            rubric=build_rubric(),
+            rubric=build_rubric(reward_basis=user_rb, sidecar_dir=sidecar_dir),
             **kwargs,
         )
         envs["user"] = user_env

@@ -68,7 +68,7 @@ def build_user_dataset(
             preference_profiles_path=preference_profiles_path,
         )
         if user_data is None:
-            continue
+            user_data = {}
         prompt_text = _build_user_prompt(task, user_data)
         rows.append(
             {

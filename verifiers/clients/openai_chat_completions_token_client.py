@@ -97,6 +97,8 @@ class OpenAIChatCompletionsTokenClient(OpenAIChatCompletionsClient):
                 prompt, model, sampling_args, tools
             )
         extra_body = sampling_args.pop("extra_body", {})
+        if tools and "tool_choice" not in extra_body and "tool_choice" not in sampling_args:
+            extra_body["tool_choice"] = "auto"
         body = dict(
             model=model,
             messages=prompt,
