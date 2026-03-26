@@ -325,10 +325,6 @@ def _build_user_context(user_data: Optional[dict]) -> str:
 
     parts = []
 
-    user_id = user_data.get("user_id")
-    if user_id:
-        parts.append(f"<user_id>\n{user_id}\n</user_id>")
-
     emails = user_data.get("emails", [])
     if emails:
         email_text = "\n\n".join(
