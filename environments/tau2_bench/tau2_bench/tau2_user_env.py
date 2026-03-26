@@ -149,6 +149,9 @@ class Tau2UserEnv(vf.MultiTurnEnv):
 
         # If content is None (reasoning_parser put everything in reasoning_content), use that.
         user_text = last_msg.get("content") or last_msg.get("reasoning_content") or ""
+        # Strip <think> blocks before forwarding to platform simulator
+        import re as _re
+        user_text = _re.sub(r"<think>.*?</think>\s*", "", user_text, flags=_re.DOTALL).strip()
 
         if not user_text:
             logger.warning("Trained model returned empty/None content — ending rollout")
