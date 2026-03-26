@@ -87,24 +87,12 @@ def build_simulation_run(
     tool calls) are stored in ``state["__platform_msgs__"]`` and used directly.
     For platform training, the verifiers trajectory is used.
     """
-    explicit = state.get("__tau2_termination__")
-    stop_condition = state.get("stop_condition", "")
-    if explicit == "user_stop":
-        termination = TerminationReason.USER_STOP
-    elif explicit == "agent_stop":
-        termination = TerminationReason.AGENT_STOP
-    elif explicit == "error" or state.get("error"):
-        termination = TerminationReason.AGENT_ERROR
-    elif "max_turns" in str(stop_condition):
-        termination = TerminationReason.MAX_STEPS
-    elif state.get("__tau2_booking_confirmed__"):
-        # Booking was confirmed but no explicit stop signal — treat as USER_STOP
-        # so the tau2 evaluator scores the interaction (it requires USER_STOP or AGENT_STOP).
-        termination = TerminationReason.USER_STOP
-    else:
-        # Fallback: unknown stop condition → treat as agent error to avoid
-        # incorrect reward for truncated/failed rollouts
-        termination = TerminationReason.AGENT_ERROR
+    # Always evaluate every trace regardless of termination reason.
+    # tau2's evaluator hard-gates on USER_STOP/AGENT_STOP, so we map everything
+    # to USER_STOP to get partial rewards (ACTION score, etc.) even on failed traces.
+    # Failed bookings still score 0 on DB/BOOKING_ACCURACY, but partial credit on
+    # ACTION/PREFERENCE_SATISFACTION creates a denser learning signal.
+    termination = TerminationReason.USER_STOP
 
     platform_msgs = state.get("__platform_msgs__")
     if platform_msgs:
