@@ -158,7 +158,28 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
 
         tools: AirlineTools = state["__tau2_tools__"]
         tool_calls = last_msg.get("tool_calls")
-        content_preview = (last_msg.get("content") or "")[:60]
+        content = last_msg.get("content") or ""
+
+        # When reasoning_parser=qwen3 and tool_call_parser=hermes are both active,
+        # vLLM may not parse <tool_call>...</tool_call> tags into structured tool_calls.
+        # Fall back to parsing them manually from the content.
+        if not tool_calls and "<tool_call>" in content:
+            import re as _re, uuid as _uuid
+            parsed = []
+            for m in _re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", content, _re.DOTALL):
+                try:
+                    obj = json.loads(m.group(1))
+                    parsed.append({
+                        "id": f"call_{_uuid.uuid4().hex[:8]}",
+                        "name": obj.get("name", ""),
+                        "arguments": json.dumps(obj.get("arguments", {})),
+                    })
+                except Exception:
+                    pass
+            if parsed:
+                tool_calls = parsed
+
+        content_preview = content[:60]
         print(f"[ENV_RESP] tool_calls={bool(tool_calls)} content={content_preview!r}", flush=True)
 
         # Case 1: Tool calls
