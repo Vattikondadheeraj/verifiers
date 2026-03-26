@@ -171,6 +171,8 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
                 result = await execute_tool_call(tools, tc_name, tc_args)
                 if result.startswith("Error:"):
                     state["__tau2_error_count__"] = state.get("__tau2_error_count__", 0) + 1
+                elif tc_name == "book_reservation" and "reservation_id" in result:
+                    state["__tau2_booking_confirmed__"] = True
                 tool_results.append(
                     {
                         "role": "tool",
@@ -238,6 +240,13 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
                 if not stripped:
                     stripped = "Please continue — I need more help with this."
                 return [{"role": "user", "content": stripped}]
+
+        # If a booking was confirmed and the user has responded (even without ###STOP###),
+        # end the rollout now so it gets scored properly by the tau2 evaluator.
+        if state.get("__tau2_booking_confirmed__"):
+            state["__tau2_termination__"] = "user_stop"
+            state["final_env_response"] = [{"role": "user", "content": user_content}]
+            return state["final_env_response"]
 
         return [{"role": "user", "content": user_content}]
 

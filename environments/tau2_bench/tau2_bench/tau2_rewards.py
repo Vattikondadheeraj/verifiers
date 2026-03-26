@@ -97,6 +97,10 @@ def build_simulation_run(
         termination = TerminationReason.AGENT_ERROR
     elif "max_turns" in str(stop_condition):
         termination = TerminationReason.MAX_STEPS
+    elif state.get("__tau2_booking_confirmed__"):
+        # Booking was confirmed but no explicit stop signal — treat as USER_STOP
+        # so the tau2 evaluator scores the interaction (it requires USER_STOP or AGENT_STOP).
+        termination = TerminationReason.USER_STOP
     else:
         # Fallback: unknown stop condition → treat as agent error to avoid
         # incorrect reward for truncated/failed rollouts
