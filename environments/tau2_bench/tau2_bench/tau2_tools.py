@@ -31,11 +31,17 @@ def get_vf_tool_defs(tools: AirlineTools) -> list[VFTool]:
     function-calling format.  We extract the relevant fields and build
     provider-agnostic ``verifiers.types.Tool`` objects.
     """
+    # Tools to exclude from the model's tool list.
+    # run_python uses signal.alarm which crashes in async threads.
+    EXCLUDED_TOOLS = {"run_python"}
+
     tau2_tools: dict[str, Tau2Tool] = tools.get_tools()
     vf_tools: list[VFTool] = []
     for _name, tau2_tool in tau2_tools.items():
         schema = tau2_tool.openai_schema  # {"type": "function", "function": {...}}
         func_schema = schema["function"]
+        if func_schema["name"] in EXCLUDED_TOOLS:
+            continue
         vf_tools.append(
             VFTool(
                 name=func_schema["name"],
