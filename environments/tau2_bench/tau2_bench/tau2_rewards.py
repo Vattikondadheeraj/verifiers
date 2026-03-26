@@ -125,8 +125,8 @@ def build_simulation_run(
         for msg in all_messages:
             key = (
                 msg.get("role", ""),
-                msg.get("content", ""),
-                str(msg.get("tool_calls", "")),
+                msg.get("content") or "",  # normalize None → "" so both copies are treated as identical
+                str(msg.get("tool_calls") or ""),
                 msg.get("tool_call_id", ""),
             )
             if key not in seen:
