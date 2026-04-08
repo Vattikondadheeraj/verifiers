@@ -61,12 +61,14 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
         user_llm: str = "gpt-4.1-mini",
         user_llm_args: Optional[dict] = None,
         db_path: Optional[str] = None,
+        seq_len: int = 25000,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.user_llm = user_llm
         self.user_llm_args = user_llm_args or {}
         self.db_path = db_path
+        self.seq_len = seq_len
         self._base_db: Optional[FlightDB] = None
 
     def _get_base_db(self) -> FlightDB:
@@ -141,7 +143,20 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
 
     async def get_prompt_messages(self, state: State) -> Messages:
         messages = await super().get_prompt_messages(state)
-        return _strip_thinking(messages)
+        messages = _strip_thinking(messages)
+        # Save full untruncated history for reward evaluation (rewards need the
+        # complete trace even when the model only sees a sliding window).
+        state["__full_messages__"] = _msgs_to_dicts(messages)
+        return _sliding_window(messages, self.seq_len)
+
+    async def render_completion(self, state: State):
+        await super().render_completion(state)
+        # Append the final completion to __full_messages__ so reward evaluation sees the complete
+        # trace. The stop condition fires after the last model generation without calling
+        # get_prompt_messages() again, so the final assistant message would otherwise be missing.
+        if "__full_messages__" in state and state.get("trajectory"):
+            last_completion = state["trajectory"][-1].get("completion", [])
+            state["__full_messages__"] = state["__full_messages__"] + _msgs_to_dicts(last_completion)
 
     async def env_response(
         self, messages: Messages, state: State, **kwargs
@@ -155,6 +170,12 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
         last_msg = _get_last_assistant(messages)
         if last_msg is None:
             return [{"role": "user", "content": "Hello, I need help with a booking."}]
+
+        # Append the model's latest completion to full history.
+        # get_prompt_messages() saved everything up to the previous turn;
+        # this adds the current turn's assistant message (which may contain book_reservation).
+        if "__full_messages__" in state:
+            state["__full_messages__"] = state["__full_messages__"] + [last_msg]
 
         tools: AirlineTools = state["__tau2_tools__"]
         tool_calls = last_msg.get("tool_calls")
@@ -317,6 +338,77 @@ def _strip_thinking(messages: Messages) -> Messages:
         else:
             result.append(msg)
     return result
+
+
+def _msgs_to_dicts(messages: Messages) -> list[dict]:
+    """Convert messages (dict or typed objects) to plain dicts."""
+    result = []
+    for m in messages:
+        if isinstance(m, dict):
+            result.append(m)
+        elif hasattr(m, "model_dump"):
+            result.append(m.model_dump())
+        else:
+            result.append(dict(m))
+    return result
+
+
+def _sliding_window(messages: Messages, seq_len: int) -> Messages:
+    """Truncate messages to fit within seq_len, always keeping system prompt and last message.
+
+    Uses char-count // 4 as a token estimate. Reserves 8192 tokens for model output.
+    Only drops messages when the conversation is genuinely too long — most turns are unaffected.
+
+    Drops messages atomically: an assistant message with tool_calls is always dropped together
+    with its immediately following tool-result messages, so the window never contains an orphaned
+    tool result without its corresponding tool call.
+    """
+    if len(messages) <= 2:
+        return messages
+
+    budget = seq_len - 8192  # tokens reserved for model output
+
+    def _token_estimate(msgs):
+        total = 0
+        for m in msgs:
+            d = m if isinstance(m, dict) else (m.model_dump() if hasattr(m, "model_dump") else dict(m))
+            total += (len(str(d.get("content") or "")) + len(str(d.get("tool_calls") or ""))) // 4
+        return total
+
+    def _role(m):
+        return m.get("role", "") if isinstance(m, dict) else getattr(m, "role", "")
+
+    def _tool_calls(m):
+        return m.get("tool_calls") if isinstance(m, dict) else getattr(m, "tool_calls", None)
+
+    def _drop_front_unit(mid: list) -> list:
+        """Drop the first atomic unit: an assistant+tool_calls message together with its tool results."""
+        if not mid:
+            return mid
+        i = 1
+        if _role(mid[0]) == "assistant" and _tool_calls(mid[0]):
+            while i < len(mid) and _role(mid[i]) == "tool":
+                i += 1
+        return mid[i:]
+
+    if _token_estimate(messages) <= budget:
+        return messages
+
+    system = [messages[0]]
+    last = [messages[-1]]
+    middle = list(messages[1:-1])
+
+    while middle and _token_estimate(system + middle + last) > budget:
+        middle = _drop_front_unit(middle)
+
+    if len(middle) < len(messages) - 2:
+        logger.warning(
+            "Sliding window dropped %d messages to fit within seq_len=%d",
+            len(messages) - 2 - len(middle),
+            seq_len,
+        )
+
+    return system + middle + last
 
 
 def _prepend_system(prompt: Messages, policy: str) -> Messages:

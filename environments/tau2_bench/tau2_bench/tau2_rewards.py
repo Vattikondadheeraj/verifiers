@@ -101,9 +101,24 @@ def build_simulation_run(
         # These are tau2 Message objects containing the real tool calls (including
         # book_reservation) that the evaluators need to score the interaction.
         tau2_messages = list(platform_msgs)
+    elif state.get("__full_messages__"):
+        # Platform training: use the directly tracked full message history.
+        # This is correct even when a sliding window was applied during rollout —
+        # the env saves the untruncated history here for exactly this purpose.
+        all_messages: list[dict[str, Any]] = list(state["__full_messages__"])
+
+        # Strip trailing assistant tool-call messages that have no following tool result.
+        while all_messages:
+            last = all_messages[-1]
+            if last.get("role") == "assistant" and last.get("tool_calls"):
+                all_messages.pop()
+            else:
+                break
+
+        tau2_messages = _vf_messages_to_tau2(all_messages)
     else:
-        # Platform training: reconstruct from the verifiers trajectory.
-        all_messages: list[dict[str, Any]] = []
+        # Fallback: reconstruct from the verifiers trajectory (legacy path, no sliding window).
+        all_messages = []
         for step in state.get("trajectory", []):
             prompt_msgs = step.get("prompt", [])
             completion_msgs = step.get("completion", [])
@@ -118,15 +133,8 @@ def build_simulation_run(
                 else:
                     all_messages.append(msg.model_dump() if hasattr(msg, "model_dump") else dict(msg))
 
-        # Deduplicate messages that appear in both prompt and completion of successive steps.
-        # tool_call_id must be included in the key so that two different tool results with
-        # identical content are not incorrectly collapsed into one.
         def _norm_content(c):
-            """Normalize content for dedup: strip <think> blocks, treat None/"" as identical."""
             s = (c or "").strip()
-            # Strip <think>...</think> blocks — with enable_thinking=true the same assistant
-            # message appears in completion with think content and in the next step's prompt
-            # with think stripped, producing two different content values for the same message.
             s = re.sub(r"<think>.*?</think>\s*", "", s, flags=re.DOTALL).strip()
             return s
 
@@ -143,9 +151,6 @@ def build_simulation_run(
                 seen.add(key)
                 unique_messages.append(msg)
 
-        # Strip trailing assistant tool-call messages that have no following tool result.
-        # This happens when a rollout ends (max_turns) mid-tool-call. The tau2 evaluator
-        # crashes if it sees a tool_call with no subsequent ToolMessage.
         while unique_messages:
             last = unique_messages[-1]
             if last.get("role") == "assistant" and last.get("tool_calls"):
@@ -273,10 +278,27 @@ def _make_reward_fn(return_field: str, reward_basis: list[str] | None, sidecar_d
                 await asyncio.to_thread(_save_sidecar, state, result, sidecar_dir)
             return result
         except Exception as exc:
-            logger.warning("tau2_%s failed: %s", return_field, exc)
+            import traceback as _tb
+            logger.error(
+                "tau2_%s failed for trajectory %s: %s\n%s",
+                return_field,
+                state.get("trajectory_id", "unknown"),
+                exc,
+                _tb.format_exc(),
+            )
+            state["__reward_error__"] = f"{type(exc).__name__}: {exc}"
             return 0.0
     _fn.__name__ = return_field
     return _fn
+
+
+async def _reward_error_metric(state: State, info: dict, **kwargs) -> float:
+    """1.0 if reward computation failed for this rollout, 0.0 otherwise.
+
+    WandB will average this across the batch, giving error rate per step.
+    A non-zero value means some rollouts are silently getting 0 reward due to bugs.
+    """
+    return 1.0 if state.get("__reward_error__") else 0.0
 
 
 async def _compute_reward(state: State, info: dict, return_field: str, reward_basis: list[str] | None = None) -> float:
@@ -349,4 +371,5 @@ def build_rubric(reward_basis: list[str] | None = None, sidecar_dir: str | None 
     rubric.add_metric(_make_reward_fn("preference_satisfaction", reward_basis))
     rubric.add_metric(_make_reward_fn("action_correctness", reward_basis))
     rubric.add_metric(_make_reward_fn("success_rate", reward_basis))
+    rubric.add_metric(_reward_error_metric)
     return rubric
