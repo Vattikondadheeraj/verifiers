@@ -1,7 +1,9 @@
 """User agent environment: the model being trained IS the user agent.
 
-The user agent learns to negotiate with a fixed platform (LLMAgent) to book
-flights that match its preference profile.
+Two modes:
+  - Single-airline: user sends text to a fixed platform LLMAgent
+  - Marketplace: user makes tool calls (list_airlines, query_airline, get_user_details)
+    to shop across multiple airline agents
 """
 
 from __future__ import annotations
@@ -25,10 +27,13 @@ from tau2.data_model.message import (
 from tau2.data_model.tasks import Task
 from tau2.domains.airline_a2a.data_model import FlightDB
 from tau2.domains.airline_a2a.tools import AirlineTools
+from tau2.environment.environment import Environment as Tau2Environment
 
 from .tau2_tools import (
     apply_initial_state,
     create_airline_tools,
+    execute_tool_call,
+    get_marketplace_tool_defs,
     load_db,
 )
 
@@ -36,13 +41,21 @@ logger = logging.getLogger(__name__)
 
 STOP_TOKEN = "###STOP###"
 
-USER_SYSTEM_PROMPT = """You are a personal travel assistant calling an airline's customer service to book a flight for your user.
+def _load_user_guidelines() -> str:
+    """Load simulation_guidelines_agent.md from tau2 data directory."""
+    from tau2.utils import DATA_DIR
+    guidelines_path = DATA_DIR / "tau2" / "user_simulator" / "simulation_guidelines_agent.md"
+    try:
+        with open(guidelines_path, "r") as fp:
+            return fp.read()
+    except FileNotFoundError:
+        return (
+            "You are an AI agent representing a traveler in a multi-agent booking system.\n"
+            "Communicate the traveler's needs clearly and accurately to the platform agent.\n"
+            "Keep talking until you receive a reservation confirmation, or until it is clear the booking cannot be completed."
+        )
 
-Your goal is to get a booking that matches your user's preferences as closely as possible.
-
-Be clear, concise, and assertive about preferences. If the agent offers something that doesn't match, negotiate for better options.
-
-Use <think>...</think> for your internal reasoning only. After </think>, output your actual message to the airline agent — never put your final response inside the <think> block.
+USER_SYSTEM_PROMPT = """{guidelines}
 
 {context}"""
 
@@ -434,12 +447,358 @@ def _build_user_context(user_data: Optional[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def _prepend_system(prompt: Messages, context: str) -> Messages:
+def _prepend_system(prompt: Messages, context: str, system_template: str = USER_SYSTEM_PROMPT) -> Messages:
     """Prepend system message with user context to the prompt."""
+    guidelines = _load_user_guidelines()
     system_msg = {
         "role": "system",
-        "content": USER_SYSTEM_PROMPT.format(context=context),
+        "content": system_template.format(guidelines=guidelines, context=context),
     }
     if prompt and isinstance(prompt[0], dict) and prompt[0].get("role") == "system":
         return [system_msg] + list(prompt[1:])
     return [system_msg] + list(prompt)
+
+
+# ---------------------------------------------------------------------------
+# Marketplace User Environment
+# ---------------------------------------------------------------------------
+
+MARKETPLACE_USER_SYSTEM_PROMPT = """{guidelines}
+
+## Marketplace Mode
+
+You are shopping for the best flight deal across multiple airlines.
+
+You have three tools:
+- list_airlines() — see available airlines
+- query_airline(airline_id, message) — send a message to a specific airline's customer service
+- get_user_details() — get the user's ID and payment methods
+
+IMPORTANT: Airlines can ONLY hear you through query_airline(). Plain text messages are NOT sent to anyone.
+
+Strategy:
+1. Call list_airlines() to see options
+2. Query multiple airlines to compare prices and availability
+3. Negotiate for the best deal matching your user's preferences
+4. Book through the airline that offers the best match
+
+{context}"""
+
+MAX_INNER_STEPS = 10  # max tool-call rounds per query_airline call
+
+
+class Tau2MarketplaceUserEnv(vf.MultiTurnEnv):
+    """MultiTurnEnv where the trained model plays the user in a multi-airline marketplace.
+
+    The user agent makes tool calls (list_airlines, query_airline, get_user_details).
+    Each airline has its own LLMAgent with carrier-specific policy and filtered tools.
+    """
+
+    def __init__(
+        self,
+        airline_llm: str = "gpt-4.1-mini",
+        airline_llm_args: Optional[dict] = None,
+        db_path: Optional[str] = None,
+        seq_len: int = 25000,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.airline_llm = airline_llm
+        self.airline_llm_args = airline_llm_args or {}
+        self.db_path = db_path
+        self.seq_len = seq_len
+        self._base_db: Optional[FlightDB] = None
+
+    def _get_base_db(self) -> FlightDB:
+        if self._base_db is None:
+            self._base_db = load_db(self.db_path)
+        return self._base_db
+
+    async def setup_state(self, state: State) -> State:
+        """Initialize per-rollout state: fresh DB, airline sessions, user context."""
+        info = state["info"]
+        if isinstance(info, str):
+            info = json.loads(info)
+            state["input"]["info"] = info
+
+        task_dict = info.get("task", {})
+        gen_meta = task_dict.get("generation_metadata", {})
+
+        # Fresh DB copy per rollout
+        db = deepcopy(self._get_base_db())
+
+        # Load base policy
+        from tau2.domains.airline_a2a.utils import AIRLINE_A2A_POLICY_PATH
+        with open(AIRLINE_A2A_POLICY_PATH, "r") as fp:
+            base_policy = fp.read()
+
+        # Build airline sessions from sampled_policies in task metadata
+        sampled_policies = gen_meta.get("sampled_policies", {})
+        airline_sessions: dict[str, dict] = {}
+
+        if sampled_policies:
+            from tau2.domains.airline_a2a.airline_policies import SampledAirlinePolicy, render_policy_prompt, to_seat_meal_config
+            for airline_id, raw_policy in sampled_policies.items():
+                sampled = SampledAirlinePolicy.model_validate(raw_policy)
+                airline_name = getattr(sampled, "airline_name", airline_id)
+                # Per-airline tools with carrier filter
+                airline_tools = create_airline_tools(
+                    deepcopy(db),
+                    carrier_filter=sampled.carriers,
+                    seat_meal_config=to_seat_meal_config(sampled),
+                    exclude_tools=["get_user_details", "run_python", "transfer_to_human_agents"],
+                    extra_bag_fee=sampled.baggage.extra_bag_fee,
+                )
+                apply_initial_state(airline_tools, task_dict)
+
+                # Per-airline policy
+                airline_policy = f"{base_policy}\n\n# {airline_name} — Airline-Specific Policy\n\n{render_policy_prompt(sampled)}"
+
+                # Create airline agent
+                tau2_tool_defs = list(airline_tools.get_tools().values())
+                airline_agent = LLMAgent(
+                    tools=tau2_tool_defs,
+                    domain_policy=airline_policy,
+                    llm=self.airline_llm,
+                    llm_args=deepcopy(self.airline_llm_args),
+                )
+
+                # Initialize agent with greeting (matches MarketplaceOrchestrator.AirlineSession)
+                greeting = Tau2AssistantMsg(
+                    role="assistant",
+                    content=f"Welcome to {airline_name}! How can I help you?",
+                    cost=0.0,
+                )
+                agent_state = airline_agent.get_init_state(message_history=[greeting])
+
+                airline_sessions[airline_id] = {
+                    "name": sampled.airline_name if hasattr(sampled, "airline_name") else airline_id,
+                    "agent": airline_agent,
+                    "agent_state": agent_state,
+                    "tools": airline_tools,
+                    "policy": airline_policy,
+                }
+
+        # Store environment state
+        state["__airline_sessions__"] = airline_sessions
+        state["__tau2_error_count__"] = 0
+        state["__tau2_max_errors__"] = 10
+        state["__tau2_turn_count__"] = 0
+        state["__booked_airline__"] = None
+        state["__flight_db__"] = db
+        state["__platform_msgs__"] = []  # Accumulate all airline agent msgs for evaluation
+        state["__marketplace_info__"] = {
+            "airlines": {aid: {"name": s["name"], "queries": 0} for aid, s in airline_sessions.items()},
+            "airlines_queried": {},
+            "booked_airline": None,
+        }
+
+        # User gets marketplace tools
+        state["tool_defs"] = get_marketplace_tool_defs()
+
+        # Also store task init data for get_user_details tool
+        state["__task_dict__"] = task_dict
+
+        # Build user context and system prompt
+        user_data = info.get("user_data", {})
+        context = _build_user_context(user_data)
+        state["input"]["prompt"] = _prepend_system(
+            state["prompt"], context, system_template=MARKETPLACE_USER_SYSTEM_PROMPT
+        )
+
+        return state
+
+    @vf.stop
+    async def too_many_tool_errors(self, state: State) -> bool:
+        return state.get("__tau2_error_count__", 0) >= state.get("__tau2_max_errors__", 5)
+
+    async def get_prompt_messages(self, state: State) -> Messages:
+        messages = await super().get_prompt_messages(state)
+        messages = _strip_thinking(messages)
+        state["__full_messages__"] = _msgs_to_dicts(messages)
+        return _sliding_window(messages, self.seq_len)
+
+    async def render_completion(self, state: State):
+        await super().render_completion(state)
+        if "__full_messages__" in state and state.get("trajectory"):
+            last_completion = state["trajectory"][-1].get("completion", [])
+            state["__full_messages__"] = state["__full_messages__"] + _msgs_to_dicts(last_completion)
+
+    async def env_response(
+        self, messages: Messages, state: State, **kwargs
+    ) -> Messages | str:
+        """Process the marketplace user's output (tool calls or text)."""
+        last_msg = _get_last_assistant(messages)
+        if last_msg is None:
+            return [{"role": "user", "content": "Welcome to the airline marketplace! Use list_airlines() to get started."}]
+
+        if "__full_messages__" in state:
+            state["__full_messages__"] = state["__full_messages__"] + [last_msg]
+
+        tool_calls = last_msg.get("tool_calls")
+        content = last_msg.get("content") or ""
+
+        # Check for STOP
+        if STOP_TOKEN in content:
+            state["__tau2_termination__"] = "user_stop"
+            state["final_env_response"] = [{"role": "user", "content": "[Conversation ended by user]"}]
+            return state["final_env_response"]
+
+        # Handle tool calls
+        if tool_calls:
+            tool_results = []
+            for tc in tool_calls:
+                tc_id = tc.get("id", "")
+                tc_name = tc.get("name", "")
+                tc_args = tc.get("arguments", "{}")
+                if isinstance(tc_args, str):
+                    try:
+                        tc_args = json.loads(tc_args)
+                    except json.JSONDecodeError:
+                        tc_args = {}
+
+                result = await self._handle_marketplace_tool(tc_name, tc_args, state)
+                if result.startswith("Error:"):
+                    state["__tau2_error_count__"] = state.get("__tau2_error_count__", 0) + 1
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": result,
+                })
+
+            state["__tau2_turn_count__"] = state.get("__tau2_turn_count__", 0) + 1
+            return tool_results
+
+        # Plain text — remind user to use tools
+        state["__tau2_turn_count__"] = state.get("__tau2_turn_count__", 0) + 1
+        return [{
+            "role": "user",
+            "content": (
+                "Your message was NOT sent to any airline. "
+                "Airlines can only receive messages through query_airline(). "
+                "Use query_airline(airline_id, message) to talk to an airline."
+            ),
+        }]
+
+    async def _handle_marketplace_tool(
+        self, tool_name: str, args: dict, state: State
+    ) -> str:
+        """Route marketplace tool calls."""
+        airline_sessions = state["__airline_sessions__"]
+
+        if tool_name == "list_airlines":
+            airlines = [
+                {"id": aid, "name": s["name"]}
+                for aid, s in airline_sessions.items()
+            ]
+            return json.dumps(airlines, indent=2)
+
+        elif tool_name == "get_user_details":
+            return self._get_user_details(state)
+
+        elif tool_name == "query_airline":
+            airline_id = args.get("airline_id", "")
+            message = args.get("message", "")
+            if airline_id not in airline_sessions:
+                available = list(airline_sessions.keys())
+                return f"Error: airline '{airline_id}' not found. Available: {available}"
+            return await self._query_airline(airline_id, message, state)
+
+        else:
+            return f"Error: unknown tool '{tool_name}'. Available: list_airlines, query_airline, get_user_details"
+
+    async def _query_airline(
+        self, airline_id: str, message: str, state: State
+    ) -> str:
+        """Send message to airline agent, run inner loop until text response."""
+        session = state["__airline_sessions__"][airline_id]
+        agent: LLMAgent = session["agent"]
+        agent_state: LLMAgentState = session["agent_state"]
+        tools: AirlineTools = session["tools"]
+
+        # Track queries
+        mkt_info = state["__marketplace_info__"]
+        mkt_info["airlines"][airline_id]["queries"] = mkt_info["airlines"][airline_id].get("queries", 0) + 1
+        mkt_info["airlines_queried"][airline_id] = mkt_info["airlines"][airline_id]["queries"]
+
+        user_msg = Tau2UserMsg(role="user", content=message)
+        prev_msg_len = len(agent_state.messages)
+
+        try:
+            agent_reply, agent_state = await asyncio.to_thread(
+                agent.generate_next_message, user_msg, agent_state
+            )
+
+            inner_steps = 0
+            while agent_reply.tool_calls and inner_steps < MAX_INNER_STEPS:
+                tool_results = []
+                for tc in agent_reply.tool_calls:
+                    try:
+                        result = tools.use_tool(tc.name, **tc.arguments)
+                        if not isinstance(result, str):
+                            result = Tau2Environment.to_json_str(result)
+                        tool_results.append(
+                            Tau2ToolMsg(id=tc.id, role="tool", content=result)
+                        )
+                        # Detect successful booking
+                        if tc.name == "book_reservation" and "error" not in result.lower()[:50]:
+                            state["__booked_airline__"] = airline_id
+                            mkt_info["booked_airline"] = airline_id
+                    except Exception as exc:
+                        state["__tau2_error_count__"] = state.get("__tau2_error_count__", 0) + 1
+                        tool_results.append(
+                            Tau2ToolMsg(id=tc.id, role="tool", content=f"Error: {exc}", error=True)
+                        )
+
+                if len(tool_results) == 1:
+                    feed_msg = tool_results[0]
+                else:
+                    feed_msg = Tau2MultiToolMsg(role="tool", tool_messages=tool_results)
+
+                agent_reply, agent_state = await asyncio.to_thread(
+                    agent.generate_next_message, feed_msg, agent_state
+                )
+                inner_steps += 1
+
+            session["agent_state"] = agent_state
+
+            # Accumulate platform msgs for evaluation
+            new_msgs = list(agent_state.messages[prev_msg_len:])
+            state["__platform_msgs__"].extend(new_msgs)
+
+            if agent_reply.tool_calls:
+                return f"[{session['name']} is still processing after {MAX_INNER_STEPS} tool calls. Try a simpler request.]"
+
+            name = session["name"]
+            return f"[{name}]: {agent_reply.content or ''}"
+
+        except Exception as exc:
+            logger.warning("Airline %s error: %s", airline_id, exc)
+            return f"Error communicating with {session['name']}: {exc}"
+
+    def _get_user_details(self, state: State) -> str:
+        """Return user ID and payment methods from task initialization data."""
+        task_dict = state.get("__task_dict__", {})
+        try:
+            init_data = (task_dict.get("initial_state") or {}).get("initialization_data")
+            agent_data = (init_data.get("agent_data") if init_data else None) or {}
+            users = agent_data.get("users", {})
+            if not users:
+                return json.dumps({"user_id": None, "payment_methods": []})
+
+            user_id, user_data = next(iter(users.items()))
+            raw_payments = user_data.get("payment_methods", {})
+            payment_methods = []
+            for pm_id, pm in raw_payments.items():
+                entry = {"id": pm_id, "source": pm.get("source", "unknown")}
+                if pm.get("source") == "credit_card":
+                    entry["brand"] = pm.get("brand", "")
+                    entry["last_four"] = pm.get("last_four", "")
+                elif pm.get("source") in ("gift_card", "certificate"):
+                    entry["amount"] = pm.get("amount", 0)
+                payment_methods.append(entry)
+
+            return json.dumps({"user_id": user_id, "payment_methods": payment_methods}, indent=2)
+        except Exception as e:
+            logger.warning("get_user_details failed: %s", e)
+            return f"Error retrieving user details: {e}"

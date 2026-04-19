@@ -33,17 +33,15 @@ logger = logging.getLogger(__name__)
 STOP_TOKEN = "###STOP###"
 TRANSFER_TOKEN = "###TRANSFER###"
 
-PLATFORM_SYSTEM_PROMPT = """You are a customer service agent for an airline. Help the user with their request according to the policy below.
-
+PLATFORM_SYSTEM_PROMPT = """<instructions>
+You are a customer service agent that helps the user according to the <policy> provided below.
 In each turn you can either:
-- Send a text message to the user.
-- Make one or more tool calls.
+- Send a message to the user.
+- Make a tool call.
 You cannot do both at the same time.
 
-Always follow the policy. Always generate valid JSON for tool calls.
-
-Use <think>...</think> for your internal reasoning only. After </think>, output your actual message to the user OR your tool call — never put your final response inside the <think> block.
-
+Try to be helpful and always follow the policy. Always make sure you generate valid JSON only.
+</instructions>
 <policy>
 {policy}
 </policy>"""
@@ -62,6 +60,7 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
         user_llm_args: Optional[dict] = None,
         db_path: Optional[str] = None,
         seq_len: int = 25000,
+        carrier_id: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -69,6 +68,7 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
         self.user_llm_args = user_llm_args or {}
         self.db_path = db_path
         self.seq_len = seq_len
+        self.carrier_id = carrier_id  # If set, use per-carrier policy from task metadata
         self._base_db: Optional[FlightDB] = None
 
     def _get_base_db(self) -> FlightDB:
@@ -84,21 +84,55 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
             state["input"]["info"] = info
 
         task_dict = info.get("task", {})
+        gen_meta = task_dict.get("generation_metadata", {})
 
         # Fresh DB copy per rollout
         db = deepcopy(self._get_base_db())
-        tools = create_airline_tools(db)
+
+        # Per-carrier tools (marketplace: each airline sees only its own flights)
+        carrier_filter = None
+        seat_meal_config = None
+        extra_bag_fee = 50
+        if self.carrier_id and gen_meta.get("sampled_policies"):
+            from tau2.domains.airline_a2a.airline_policies import SampledAirlinePolicy, to_seat_meal_config
+            raw_policy = gen_meta["sampled_policies"].get(self.carrier_id)
+            if raw_policy:
+                sampled = SampledAirlinePolicy.model_validate(raw_policy)
+                carrier_filter = sampled.carriers
+                extra_bag_fee = sampled.baggage.extra_bag_fee
+                seat_meal_config = to_seat_meal_config(sampled)
+
+        tools = create_airline_tools(
+            db,
+            carrier_filter=carrier_filter,
+            seat_meal_config=seat_meal_config,
+            extra_bag_fee=extra_bag_fee,
+        )
         apply_initial_state(tools, task_dict)
 
         # Build verifiers tool defs for the model
         vf_tool_defs = get_vf_tool_defs(tools)
         state["tool_defs"] = vf_tool_defs
 
-        # Policy for system prompt
-        from tau2.domains.airline_a2a.utils import AIRLINE_A2A_POLICY_PATH
-
-        with open(AIRLINE_A2A_POLICY_PATH, "r") as fp:
-            policy = fp.read()
+        # Build policy: use composable per-carrier policy if available, else base policy
+        if self.carrier_id and gen_meta.get("sampled_policies"):
+            from tau2.domains.airline_a2a.airline_policies import SampledAirlinePolicy, render_policy_prompt
+            raw_policy = gen_meta["sampled_policies"].get(self.carrier_id)
+            if raw_policy:
+                sampled = SampledAirlinePolicy.model_validate(raw_policy)
+                airline_name = getattr(sampled, "airline_name", self.carrier_id)
+                from tau2.domains.airline_a2a.utils import AIRLINE_A2A_POLICY_PATH
+                with open(AIRLINE_A2A_POLICY_PATH, "r") as fp:
+                    base_policy = fp.read()
+                policy = f"{base_policy}\n\n# {airline_name} — Airline-Specific Policy\n\n{render_policy_prompt(sampled)}"
+            else:
+                from tau2.domains.airline_a2a.utils import AIRLINE_A2A_POLICY_PATH
+                with open(AIRLINE_A2A_POLICY_PATH, "r") as fp:
+                    policy = fp.read()
+        else:
+            from tau2.domains.airline_a2a.utils import AIRLINE_A2A_POLICY_PATH
+            with open(AIRLINE_A2A_POLICY_PATH, "r") as fp:
+                policy = fp.read()
 
         # Store environment state
         state["__tau2_tools__"] = tools
@@ -107,6 +141,8 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
         state["__tau2_max_errors__"] = 10
         state["__tau2_turn_count__"] = 0
         state["__tau2_min_turns__"] = 3
+        state["__flight_db__"] = db  # For REVENUE evaluator recomputation
+        state["__booked_airline__"] = self.carrier_id  # For POLICY_COMPLIANCE and REVENUE
 
         # Create simulated user
         task = Task.model_validate(task_dict)
@@ -215,6 +251,13 @@ class Tau2PlatformEnv(vf.MultiTurnEnv):
                     state["__tau2_error_count__"] = state.get("__tau2_error_count__", 0) + 1
                 elif tc_name == "book_reservation" and "reservation_id" in result:
                     state["__tau2_booking_confirmed__"] = True
+                    # Detect booked airline from flight numbers in the booking args
+                    booking_args = tc_args if isinstance(tc_args, dict) else json.loads(tc_args) if isinstance(tc_args, str) else {}
+                    flights = booking_args.get("flights", [])
+                    if flights and isinstance(flights[0], dict):
+                        fn = flights[0].get("flight_number", "")
+                        if len(fn) >= 2:
+                            state["__booked_airline__"] = fn[:2]
                 tool_results.append(
                     {
                         "role": "tool",
